@@ -99,7 +99,7 @@ void PauseIfParentIsExplorer() {
 
 void help() {
 	kdmLog(L"\r\n\r\n[!] Incorrect Usage!" << std::endl);
-	kdmLog(L"[+] Usage: kdmapper.exe [--free][--indPages][--PassAllocationPtr][--copy-header]");
+	kdmLog(L"[+] Usage: kdmapper.exe [--free][--indPages][--PassAllocationPtr][--copy-header][--iocreatedriver]");
 
 #ifdef PDB_OFFSETS
 	kdmLog(L"[--dontUpdateOffsets [--offsetsPath \"FilePath\"]]"); 
@@ -117,6 +117,12 @@ int wmain(const int argc, wchar_t** argv) {
 	bool indPagesMode = paramExists(argc, argv, L"indPages") > 0;
 	bool passAllocationPtr = paramExists(argc, argv, L"PassAllocationPtr") > 0;
 	bool copyHeader = paramExists(argc, argv, L"copy-header") > 0;
+	bool entryViaIoCreateDriver = paramExists(argc, argv, L"iocreatedriver") > 0;
+
+	if (entryViaIoCreateDriver) {
+		kdmapper::SetEntryViaIoCreateDriver(true);
+		kdmLog(L"[+] Entry point will be invoked through IoCreateDriver(NULL, DriverEntry) from a kernel thread" << std::endl);
+	}
 
 	if (free) {
 		kdmLog(L"[+] Free memory after driver execution enabled" << std::endl);

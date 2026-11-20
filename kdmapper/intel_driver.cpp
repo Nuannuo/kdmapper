@@ -95,7 +95,9 @@ std::wstring intel_driver::GetDriverPath() {
 }
 
 bool intel_driver::IsRunning() {
-	const HANDLE file_handle = CreateFileW(L"\\\\.\\Nal", FILE_ANY_ACCESS, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	// FILE_ANY_ACCESS 来自 WDK 的 wdm.h（值为 0）。这里只用作用户态探测，
+	// 传 0 即可，避免为了一个常量引入 WDK 头。
+	const HANDLE file_handle = CreateFileW(L"\\\\.\\Nal", 0, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (file_handle != nullptr && file_handle != INVALID_HANDLE_VALUE)
 	{
 		CloseHandle(file_handle);

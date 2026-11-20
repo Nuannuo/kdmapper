@@ -6,6 +6,132 @@
 #include "intel_driver.hpp"
 #include "nt.hpp"
 #include "portable_executable.hpp"
+#include <cstring>
+#include <vector>
+
+static bool kdmapper_entry_via_io_create_driver = false;
+
+void kdmapper::SetEntryViaIoCreateDriver(bool enabled) {
+	kdmapper_entry_via_io_create_driver = enabled;
+}
+
+/*
+ * Calls IoCreateDriver(NULL, DriverEntry) from a real kernel system thread.
+ *
+ * kdmapper's regular CallKernelFunction runs the target inside the patched
+ * NtAddAtom syscall, so the driver sees PreviousMode == UserMode and any
+ * Zw or Nt call that probes kernel-stack structures fails with 0xC0000005
+ * (TitanHide's FindCrossThreadFlagsOffset is one example). A PsCreateSystemThread
+ * worker runs with PreviousMode == KernelMode, exactly like a service-loaded
+ * driver.
+ *
+ * Page layout (one non-paged, executable page):
+ *   0x000  create-thread stub (calls PsCreateSystemThread on the worker)
+ *   0x100  worker stub (calls IoCreateDriver, stores the status)
+ *   0x180  HANDLE slot / 0x188 NTSTATUS slot / 0x1A0 OBJECT_ATTRIBUTES
+ */
+static bool CallEntryViaKernelThread(NTSTATUS* out_status, ULONG64 driver_entry) {
+	const ULONG64 io_create_driver =
+		intel_driver::GetKernelModuleExport(intel_driver::ntoskrnlAddr, "IoCreateDriver");
+	const ULONG64 ps_create_thread =
+		intel_driver::GetKernelModuleExport(intel_driver::ntoskrnlAddr, "PsCreateSystemThread");
+	if (io_create_driver == 0 || ps_create_thread == 0) {
+		kdmLog(L"[-] IoCreateDriver or PsCreateSystemThread was not found" << std::endl);
+		return false;
+	}
+
+	constexpr ULONG64 kPageSize = 0x1000;
+	const ULONG64 page = intel_driver::AllocatePool(nt::POOL_TYPE::NonPagedPool, kPageSize);
+	if (page == 0) {
+		kdmLog(L"[-] Failed to allocate the entry stub page" << std::endl);
+		return false;
+	}
+
+	const ULONG64 worker = page + 0x100;
+	const ULONG64 handle_slot = page + 0x180;
+	const ULONG64 status_slot = page + 0x188;
+	const ULONG64 object_attributes = page + 0x1A0;
+
+	BYTE block[0x200] = {};
+	size_t o = 0;
+	auto byte = [&](BYTE value) { block[o++] = value; };
+	auto imm64 = [&](ULONG64 value) {
+		for (int i = 0; i < 8; ++i) {
+			block[o++] = static_cast<BYTE>(value >> (i * 8));
+		}
+	};
+
+	/* create-thread stub */
+	byte(0x48); byte(0x83); byte(0xEC); byte(0x38);            /* sub rsp, 0x38 */
+	byte(0x48); byte(0xB9); imm64(handle_slot);                /* mov rcx, &handle */
+	byte(0xBA); byte(0xFF); byte(0xFF); byte(0x1F); byte(0x00);/* mov edx, THREAD_ALL_ACCESS */
+	byte(0x49); byte(0xB8); imm64(object_attributes);          /* mov r8, &object attributes */
+	byte(0x45); byte(0x31); byte(0xC9);                        /* xor r9d, r9d */
+	byte(0x48); byte(0xC7); byte(0x44); byte(0x24); byte(0x20); byte(0); byte(0); byte(0); byte(0); /* [rsp+0x20] = NULL (ClientId) */
+	byte(0x48); byte(0xB8); imm64(worker);                     /* mov rax, worker */
+	byte(0x48); byte(0x89); byte(0x44); byte(0x24); byte(0x28);/* [rsp+0x28] = worker (StartRoutine) */
+	byte(0x48); byte(0xC7); byte(0x44); byte(0x24); byte(0x30); byte(0); byte(0); byte(0); byte(0); /* [rsp+0x30] = NULL (StartContext) */
+	byte(0x48); byte(0xB8); imm64(ps_create_thread);           /* mov rax, PsCreateSystemThread */
+	byte(0xFF); byte(0xD0);                                    /* call rax */
+	byte(0x48); byte(0x83); byte(0xC4); byte(0x38);            /* add rsp, 0x38 */
+	byte(0xC3);                                                /* ret */
+
+	if (o > 0x100) {
+		kdmLog(L"[-] Internal error: create stub overflows its slot" << std::endl);
+		intel_driver::FreePool(page);
+		return false;
+	}
+
+	/* worker stub, entered with the system thread's kernel stack */
+	o = 0x100;
+	byte(0x48); byte(0x83); byte(0xEC); byte(0x28);            /* sub rsp, 0x28 */
+	byte(0x48); byte(0xB9); imm64(0);                          /* mov rcx, NULL (DriverName) */
+	byte(0x48); byte(0xBA); imm64(driver_entry);               /* mov rdx, DriverEntry */
+	byte(0x48); byte(0xB8); imm64(io_create_driver);           /* mov rax, IoCreateDriver */
+	byte(0xFF); byte(0xD0);                                    /* call rax */
+	byte(0x48); byte(0xBB); imm64(status_slot);                /* mov rbx, &status */
+	byte(0x89); byte(0x03);                                    /* mov [rbx], eax */
+	byte(0x48); byte(0x83); byte(0xC4); byte(0x28);            /* add rsp, 0x28 */
+	byte(0xC3);                                                /* ret -> thread exits */
+
+	/* OBJECT_ATTRIBUTES for PsCreateSystemThread: Length=0x30, rest zero */
+	block[0x1A0] = 0x30;
+	/* status sentinel: the worker overwrites it with the real NTSTATUS */
+	*reinterpret_cast<ULONG*>(block + 0x188) = 0xDEADBEEFu;
+
+	if (!intel_driver::WriteMemory(page, block, sizeof(block)) ||
+		!intel_driver::MmSetPageProtection(page, static_cast<uint32_t>(kPageSize), PAGE_EXECUTE_READWRITE)) {
+		kdmLog(L"[-] Failed to prepare the entry stub page" << std::endl);
+		intel_driver::FreePool(page);
+		return false;
+	}
+
+	/* The create stub only builds the thread; it returns immediately. */
+	intel_driver::CallKernelFunction<void>(nullptr, page);
+
+	HANDLE thread = nullptr;
+	if (!intel_driver::ReadMemory(handle_slot, &thread, sizeof(thread)) || thread == nullptr) {
+		kdmLog(L"[-] PsCreateSystemThread did not return a handle" << std::endl);
+		intel_driver::FreePool(page);
+		return false;
+	}
+
+	WaitForSingleObject(thread, 30000);
+
+	NTSTATUS status = 0xDEADBEEF;
+	intel_driver::ReadMemory(status_slot, &status, sizeof(status));
+
+	CloseHandle(thread);
+	intel_driver::FreePool(page);
+
+	if (status == 0xDEADBEEF) {
+		kdmLog(L"[-] The kernel worker thread did not report a status" << std::endl);
+		return false;
+	}
+
+	*out_status = status;
+	return true;
+}
 
 void RelocateImageByDelta(portable_executable::vec_relocs relocs, const ULONG64 delta) {
 	for (const auto& current_reloc : relocs) {
@@ -244,7 +370,15 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 		}
 
 		NTSTATUS status = 0;
-		if (!intel_driver::CallKernelFunction(&status, address_of_entry_point, (PassAllocationAddressAsFirstParam ? realBase : param1), param2)) {
+		if (kdmapper_entry_via_io_create_driver) {
+			kdmLog(L"[<] Invoking DriverEntry through IoCreateDriver in a kernel system thread" << std::endl);
+			if (!CallEntryViaKernelThread(&status, address_of_entry_point)) {
+				kdmLog(L"[-] Failed to invoke the entry point in a kernel thread" << std::endl);
+				kernel_image_base = realBase;
+				break;
+			}
+		}
+		else if (!intel_driver::CallKernelFunction(&status, address_of_entry_point, (PassAllocationAddressAsFirstParam ? realBase : param1), param2)) {
 			kdmLog(L"[-] Failed to call driver entry" << std::endl);
 			kernel_image_base = realBase;
 			break;
